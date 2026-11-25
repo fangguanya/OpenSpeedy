@@ -13,8 +13,8 @@
  *
  * Manual run:
  *   time_hook_test <speedpatch64.dll> [threads] [fixed|up|down|alt] [api] [iterations]
- * with api in qpc|tgt|tick|tick64|ft|ftprecise. Without extra arguments it
- * runs the full matrix (every API, a 25x->10x switch and rapid toggling).
+ * with api in qpc|qpcrtl|tgt|tick|tickkb|tick64|tick64kb|ft|ftprecise. Without
+ * extra arguments it runs the full matrix (every API, a 25x->10x switch and rapid toggling).
  */
 #define NOMINMAX
 #include <windows.h>
@@ -30,8 +30,12 @@
 #pragma comment(lib, "winmm.lib")
 
 typedef void (__cdecl* SetSpeedFn)(double);
+typedef BOOL (WINAPI* QpcFn)(LARGE_INTEGER*);
 
 static std::atomic<bool> running{true};
+static QpcFn rtlQueryPerformanceCounter = nullptr;
+static DWORD (WINAPI* kernelBaseGetTickCount)() = nullptr;
+static ULONGLONG (WINAPI* kernelBaseGetTickCount64)() = nullptr;
 
 struct Result
 {
@@ -75,14 +79,14 @@ static void reader64(Fn fn, Result* out)
     }
 }
 
-static void readerQpc(Result* out)
+static void readerQpc(Result* out, QpcFn fn)
 {
     LARGE_INTEGER prev;
-    QueryPerformanceCounter(&prev);
+    fn(&prev);
     while (running.load(std::memory_order_relaxed))
     {
         LARGE_INTEGER now;
-        QueryPerformanceCounter(&now);
+        fn(&now);
         int64_t delta = now.QuadPart - prev.QuadPart;
         if (delta < 0)
         {
@@ -121,10 +125,13 @@ static bool startReaders(const std::string& api, int threads, std::vector<Result
     for (int i = 0; i < threads; i++)
     {
         Result* r = &results[i];
-        if (api == "qpc") pool.emplace_back(readerQpc, r);
+        if (api == "qpc") pool.emplace_back(readerQpc, r, &QueryPerformanceCounter);
+        else if (api == "qpcrtl") pool.emplace_back(readerQpc, r, rtlQueryPerformanceCounter);
         else if (api == "tgt") pool.emplace_back(reader32<DWORD (WINAPI*)()>, &timeGetTime, r);
         else if (api == "tick") pool.emplace_back(reader32<DWORD (WINAPI*)()>, &GetTickCount, r);
+        else if (api == "tickkb") pool.emplace_back(reader32<DWORD (WINAPI*)()>, kernelBaseGetTickCount, r);
         else if (api == "tick64") pool.emplace_back(reader64<ULONGLONG (WINAPI*)()>, &GetTickCount64, r);
+        else if (api == "tick64kb") pool.emplace_back(reader64<ULONGLONG (WINAPI*)()>, kernelBaseGetTickCount64, r);
         else if (api == "ft") pool.emplace_back(readerFileTime<VOID (WINAPI*)(LPFILETIME)>, &GetSystemTimeAsFileTime, r);
         else if (api == "ftprecise") pool.emplace_back(readerFileTime<VOID (WINAPI*)(LPFILETIME)>, &GetSystemTimePreciseAsFileTime, r);
         else return false;
@@ -195,8 +202,18 @@ int main(int argc, char** argv)
 {
     if (argc < 2)
     {
-        printf("usage: %s <speedpatch64.dll> [threads] [fixed|up|down|alt] [qpc|tgt|tick|tick64|ft|ftprecise] [iterations]\n", argv[0]);
+        printf("usage: %s <speedpatch64.dll> [threads] [fixed|up|down|alt] [qpc|qpcrtl|tgt|tick|tickkb|tick64|tick64kb|ft|ftprecise] [iterations]\n", argv[0]);
         return 2;
+    }
+
+    rtlQueryPerformanceCounter = (QpcFn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlQueryPerformanceCounter");
+    HMODULE kernelBase = GetModuleHandleW(L"KernelBase.dll");
+    kernelBaseGetTickCount = (DWORD (WINAPI*)())GetProcAddress(kernelBase, "GetTickCount");
+    kernelBaseGetTickCount64 = (ULONGLONG (WINAPI*)())GetProcAddress(kernelBase, "GetTickCount64");
+    if (!rtlQueryPerformanceCounter || !kernelBaseGetTickCount || !kernelBaseGetTickCount64)
+    {
+        printf("Required time API not found\n");
+        return 1;
     }
 
     HMODULE dll = LoadLibraryA(argv[1]);
@@ -216,7 +233,7 @@ int main(int argc, char** argv)
     {
         // Full regression matrix. Rapid toggling is the case that used to
         // produce thousands of backwards readings in one process.
-        const char* apis[] = { "qpc", "tgt", "tick", "tick64", "ft", "ftprecise" };
+        const char* apis[] = { "qpc", "qpcrtl", "tgt", "tick", "tickkb", "tick64", "tick64kb", "ft", "ftprecise" };
         bool ok = true;
         for (const char* api : apis)
         {

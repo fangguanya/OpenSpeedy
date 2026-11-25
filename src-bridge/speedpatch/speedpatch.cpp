@@ -346,6 +346,8 @@ static ClockBase<DWORD> clock_GetTickCount;
 typedef DWORD (WINAPI* GETTICKCOUNT) (VOID);
 
 static GETTICKCOUNT Real_GetTickCount = NULL;
+static GETTICKCOUNT Real_Kernel32GetTickCount = NULL;
+static GETTICKCOUNT Target_GetTickCount = NULL;
 
 DWORD WINAPI Hook_GetTickCount(VOID)
 {
@@ -359,6 +361,8 @@ static ClockBase<ULONGLONG> clock_GetTickCount64;
 typedef ULONGLONG (WINAPI* GETTICKCOUNT64) (VOID);
 
 static GETTICKCOUNT64 Real_GetTickCount64 = NULL;
+static GETTICKCOUNT64 Real_Kernel32GetTickCount64 = NULL;
+static GETTICKCOUNT64 Target_GetTickCount64 = NULL;
 
 ULONGLONG WINAPI Hook_GetTickCount64(VOID)
 {
@@ -372,6 +376,7 @@ static ClockBase<LONGLONG> clock_QueryPerformanceCounter;
 typedef BOOL (WINAPI* QUERYPERFORMANCECOUNTER) (LARGE_INTEGER*);
 
 static QUERYPERFORMANCECOUNTER Real_QueryPerformanceCounter = NULL;
+static QUERYPERFORMANCECOUNTER Target_QueryPerformanceCounter = NULL;
 
 BOOL WINAPI Hook_QueryPerformanceCounter(LARGE_INTEGER* lpPerformanceCount)
 {
@@ -522,6 +527,7 @@ VOID MH_UNHOOK(T* pTarget)
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved)
 {
     FILETIME now = { 0 };
+    HMODULE hKernelBase;
     switch (ul_reason_for_call)
     {
     case DLL_PROCESS_ATTACH:
@@ -533,6 +539,23 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             return FALSE;
         }
         SP_Install();
+        hKernelBase = GetModuleHandleW(L"KernelBase.dll");
+        Target_GetTickCount = reinterpret_cast<GETTICKCOUNT>(GetProcAddress(hKernelBase, "GetTickCount"));
+        if (Target_GetTickCount == NULL)
+        {
+            Target_GetTickCount = &GetTickCount;
+        }
+        Target_GetTickCount64 = reinterpret_cast<GETTICKCOUNT64>(GetProcAddress(hKernelBase, "GetTickCount64"));
+        if (Target_GetTickCount64 == NULL)
+        {
+            Target_GetTickCount64 = &GetTickCount64;
+        }
+        Target_QueryPerformanceCounter = reinterpret_cast<QUERYPERFORMANCECOUNTER>(
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlQueryPerformanceCounter"));
+        if (Target_QueryPerformanceCounter == NULL)
+        {
+            Target_QueryPerformanceCounter = &QueryPerformanceCounter;
+        }
         {
             /* Seed every anchor at 1x. If a factor is already set, the first
                call to each hook rebases against the real clock before it
@@ -546,14 +569,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             baseHook_GetMessageTime.store(gmt);
             lastHook_GetMessageTime.store(gmt);
 
-            DWORD tck = GetTickCount();
+            DWORD tck = Target_GetTickCount();
             clock_GetTickCount = { 1.0, tck, tck };
 
-            ULONGLONG tck64 = GetTickCount64();
+            ULONGLONG tck64 = Target_GetTickCount64();
             clock_GetTickCount64 = { 1.0, tck64, tck64 };
 
             LARGE_INTEGER qpc;
-            QueryPerformanceCounter(&qpc);
+            Target_QueryPerformanceCounter(&qpc);
             clock_QueryPerformanceCounter = { 1.0, qpc.QuadPart, qpc.QuadPart };
 
             GetSystemTimeAsFileTime(&now);
@@ -577,9 +600,32 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
         MH_HOOK(&timeGetTime, &Hook_TimeGetTime, reinterpret_cast<LPVOID*> (&Real_TimeGetTime));
         MH_HOOK(&timeSetEvent, &Hook_TimeSetEvent, reinterpret_cast<LPVOID*>(&Real_TimeSetEvent));
         MH_HOOK(&GetMessageTime, &Hook_GetMessageTime, reinterpret_cast<LPVOID*>(&Real_GetMessageTime));
-        MH_HOOK(&GetTickCount, &Hook_GetTickCount, reinterpret_cast<LPVOID*> (&Real_GetTickCount));
-        MH_HOOK(&GetTickCount64, &Hook_GetTickCount64, reinterpret_cast<LPVOID*> (&Real_GetTickCount64));
-        MH_HOOK(&QueryPerformanceCounter, &Hook_QueryPerformanceCounter, reinterpret_cast<LPVOID*> (&Real_QueryPerformanceCounter));
+        if (!MH_HOOK(Target_GetTickCount, &Hook_GetTickCount, reinterpret_cast<LPVOID*> (&Real_GetTickCount)) &&
+            Target_GetTickCount != &GetTickCount)
+        {
+            Target_GetTickCount = &GetTickCount;
+            MH_HOOK(Target_GetTickCount, &Hook_GetTickCount, reinterpret_cast<LPVOID*> (&Real_GetTickCount));
+        }
+        if (Target_GetTickCount != &GetTickCount)
+        {
+            MH_HOOK(&GetTickCount, &Hook_GetTickCount, reinterpret_cast<LPVOID*> (&Real_Kernel32GetTickCount));
+        }
+        if (!MH_HOOK(Target_GetTickCount64, &Hook_GetTickCount64, reinterpret_cast<LPVOID*> (&Real_GetTickCount64)) &&
+            Target_GetTickCount64 != &GetTickCount64)
+        {
+            Target_GetTickCount64 = &GetTickCount64;
+            MH_HOOK(Target_GetTickCount64, &Hook_GetTickCount64, reinterpret_cast<LPVOID*> (&Real_GetTickCount64));
+        }
+        if (Target_GetTickCount64 != &GetTickCount64)
+        {
+            MH_HOOK(&GetTickCount64, &Hook_GetTickCount64, reinterpret_cast<LPVOID*> (&Real_Kernel32GetTickCount64));
+        }
+        if (!MH_HOOK(Target_QueryPerformanceCounter, &Hook_QueryPerformanceCounter, reinterpret_cast<LPVOID*> (&Real_QueryPerformanceCounter)) &&
+            Target_QueryPerformanceCounter != &QueryPerformanceCounter)
+        {
+            Target_QueryPerformanceCounter = &QueryPerformanceCounter;
+            MH_HOOK(Target_QueryPerformanceCounter, &Hook_QueryPerformanceCounter, reinterpret_cast<LPVOID*> (&Real_QueryPerformanceCounter));
+        }
         MH_HOOK(&GetSystemTimeAsFileTime, &Hook_GetSystemTimeAsFileTime, reinterpret_cast<LPVOID*> (&Real_GetSystemTimeAsFileTime));
         MH_HOOK(&GetSystemTimePreciseAsFileTime, &Hook_GetSystemTimePreciseAsFileTime, reinterpret_cast<LPVOID*> (&Real_GetSystemTimePreciseAsFileTime));
 
@@ -608,9 +654,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
             MH_UNHOOK(Real_SetTimer);
             MH_UNHOOK(Real_TimeGetTime);
             MH_UNHOOK(Real_TimeSetEvent);
-            MH_UNHOOK(Real_GetTickCount);
-            MH_UNHOOK(Real_GetTickCount64);
-            MH_UNHOOK(Real_QueryPerformanceCounter);
+            MH_UNHOOK(Target_GetTickCount);
+            MH_UNHOOK(&GetTickCount);
+            MH_UNHOOK(Target_GetTickCount64);
+            MH_UNHOOK(&GetTickCount64);
+            MH_UNHOOK(Target_QueryPerformanceCounter);
             MH_UNHOOK(Real_GetSystemTimeAsFileTime);
             MH_UNHOOK(Real_GetSystemTimePreciseAsFileTime);
         }
